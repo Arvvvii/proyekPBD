@@ -27,6 +27,11 @@ class Database {
 
     public function getConnection(): \PDO { return $this->pdo; }
 
+    // Transaction helpers
+    public function beginTransaction(): bool { return $this->pdo->beginTransaction(); }
+    public function commit(): bool { return $this->pdo->commit(); }
+    public function rollBack(): bool { return $this->pdo->rollBack(); }
+
     public function query(string $sql, array $params = []): \PDOStatement {
         $stmt = $this->pdo->prepare($sql);
         $stmt->execute($params);

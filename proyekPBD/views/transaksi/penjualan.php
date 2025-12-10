@@ -7,165 +7,255 @@ if(!isset($_SESSION['user_id'])) { header('Location: ' . BASE_PATH . '/login.php
 $db = Database::getInstance();
 $fetcher = new DataFetcher($db);
 
-$barang = $fetcher->barangAktif();
-$marginAktif = $db->fetchAll('SELECT * FROM v_marginaktif ORDER BY created_at DESC');
 $message = '';
-$activeId = isset($_GET['idpenjualan']) ? (int)$_GET['idpenjualan'] : 0;
-$defaultMarginId = isset($marginAktif[0]['idmargin_penjualan']) ? (int)$marginAktif[0]['idmargin_penjualan'] : 0;
 
-if ($_SERVER['REQUEST_METHOD']==='POST') {
-  // Single page: langsung panggil SP insert header+detail
-  $iduser = (int)$_SESSION['user_id'];
-  $idmargin = (int)($_POST['idmargin_penjualan'] ?? 0);
-  if($idmargin === 0 && $defaultMarginId > 0){
-    // Pakai margin aktif default bila user tidak memilih
-    $idmargin = $defaultMarginId;
-  }
-  $idbarang = (int)$_POST['idbarang'];
-  $jumlah = (int)$_POST['jumlah'];
-  $harga = (int)$_POST['harga_satuan'];
-  try{
-    $db->callProcedure('sp_insert_penjualan_lengkap', [$iduser,$idmargin,$idbarang,$jumlah,$harga]);
-    // Ambil header terbaru untuk user ini, lalu update total
-    $header = $db->fetch('SELECT idpenjualan FROM penjualan WHERE iduser = ? ORDER BY created_at DESC LIMIT 1', [$iduser]);
-    if ($header) {
-      $db->callProcedure('SP_UpdateHeaderPenjualan', [$header['idpenjualan']]);
+// Handle header-only actions: create header, update status, delete header (only if no details exist)
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $action = $_POST['action'] ?? '';
+  if ($action === 'create_header') {
+    $iduser = (int)$_SESSION['user_id'];
+    $idmargin = (int)($_POST['idmargin_penjualan'] ?? 0);
+    try {
+      $db->beginTransaction();
+      $db->execute('INSERT INTO penjualan (iduser, idmargin_penjualan) VALUES (?,?)', [$iduser, $idmargin]);
+      $row = $db->fetch('SELECT LAST_INSERT_ID() AS idpenjualan');
+      $newId = (int)($row['idpenjualan'] ?? 0);
+      $db->commit();
+      if ($newId > 0) {
+        header('Location: penjualan_add.php?idpenjualan=' . urlencode($newId));
+        exit;
+      } else {
+        $message = 'Gagal membuat header penjualan.';
+      }
+    } catch (Throwable $e) {
+      try { $db->rollBack(); } catch (Throwable $_) {}
+      $message = 'Gagal membuat header penjualan: ' . $e->getMessage();
     }
-    $_SESSION['flash_penjualan'] = 'Transaksi penjualan berhasil.';
-    header('Location: ' . BASE_PATH . '/views/transaksi/penjualan.php?idpenjualan=' . urlencode($header['idpenjualan']));
-    exit;
-  } catch (Throwable $e) {
-    $message = 'Gagal: ' . $e->getMessage();
+  } elseif ($action === 'update_status') {
+    $idp = (int)($_POST['idpenjualan'] ?? 0);
+    $toStatus = $_POST['to_status'] ?? 'A';
+    try {
+      // ensure status column exists; if missing, try to add it (best-effort)
+      try {
+        $col = $db->fetch("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'penjualan' AND COLUMN_NAME = 'status'");
+        $hasStatus = !empty($col['cnt']);
+      } catch (Throwable $_) { $hasStatus = false; }
+      if (!$hasStatus) {
+        try {
+          $db->execute("ALTER TABLE `penjualan` ADD COLUMN `status` CHAR(1) NOT NULL DEFAULT 'A'");
+          // attempt to recreate view silently
+          $createView = "CREATE OR REPLACE VIEW `v_penjualanheader` AS SELECT pj.`idpenjualan` AS `idpenjualan`, pj.`created_at` AS `tanggal_penjualan`, u.`username` AS `kasir`, mp.`persen` AS `margin_persen`, pj.`total_nilai` AS `total_nilai`, pj.`status` AS `status` FROM `penjualan` pj JOIN `user` u ON u.`iduser` = pj.`iduser` JOIN `margin_penjualan` mp ON mp.`idmargin_penjualan` = pj.`idmargin_penjualan`;";
+          try { $db->execute($createView); } catch (Throwable $_) {}
+        } catch (Throwable $_) { /* ignore alter errors */ }
+      }
+      $db->execute('UPDATE penjualan SET status=? WHERE idpenjualan=?', [$toStatus, $idp]);
+      $message = 'Status penjualan diperbarui.';
+    } catch (Throwable $e) { $message = 'Gagal update status: ' . $e->getMessage(); }
+  } elseif ($action === 'delete_penjualan') {
+    $idp = (int)($_POST['idpenjualan'] ?? 0);
+    if ($idp <= 0) { $message = 'ID Penjualan tidak valid.'; }
+    else {
+      try {
+        // Prevent deleting finalized headers: if status column exists and header is 'F', block deletion
+        $hdrStatus = null;
+        try {
+          $s = $db->fetch('SELECT `status` FROM penjualan WHERE idpenjualan = ? LIMIT 1', [$idp]);
+          if ($s && array_key_exists('status', $s)) $hdrStatus = $s['status'];
+        } catch (Throwable $_) { $hdrStatus = null; }
+        if ($hdrStatus === 'F') {
+          $message = 'Tidak dapat menghapus: penjualan telah difinalisasi.';
+        } else {
+          $cnt = $db->fetch('SELECT COUNT(*) AS c FROM detail_penjualan WHERE penjualan_idpenjualan = ?', [$idp]);
+          if ((int)($cnt['c'] ?? 0) > 0) {
+            $message = 'Tidak dapat menghapus: penjualan memiliki detail.';
+          } else {
+            $db->beginTransaction();
+            $db->execute('DELETE FROM penjualan WHERE idpenjualan = ?', [$idp]);
+            $db->commit();
+            $message = 'Penjualan #' . $idp . ' berhasil dihapus.';
+          }
+        }
+      } catch (Throwable $e) { try { $db->rollBack(); } catch (Throwable $_) {} $message = 'Gagal menghapus: ' . $e->getMessage(); }
+    }
   }
 }
 
-$headersAll = $fetcher->penjualanHeader();
+// Only load what we need for header list
+$marginAktif = $db->fetchAll('SELECT * FROM v_marginaktif ORDER BY created_at DESC');
+$headersAll = $fetcher->penjualanHeader(); // uses v_penjualanheader
 if(isset($_SESSION['flash_penjualan'])){ $message = $_SESSION['flash_penjualan']; unset($_SESSION['flash_penjualan']); }
-
-if ($activeId) {
-  $currentHeader = array_values(array_filter($headersAll, fn($h) => (int)$h['idpenjualan'] === $activeId));
-  $otherHeaders = array_values(array_filter($headersAll, fn($h) => (int)$h['idpenjualan'] !== $activeId));
-} else {
-  $currentHeader = [];
-  $otherHeaders = $headersAll;
-}
-$details = $db->fetchAll('SELECT * FROM v_detailpenjualanlengkap ORDER BY idpenjualan DESC, iddetail_penjualan DESC');
 
 $title = 'Transaksi Penjualan';
 ob_start();
 ?>
+<style>
+/* Layout and form tidy for Penjualan */
+.txn-wrap { display:flex; gap:20px; align-items:flex-start; }
+.txn-left { flex: 1 1 360px; }
+.txn-right { flex: 1 1 560px; }
+.txn-panel { background:white; padding:18px; border-radius:10px; border:1px solid #eef3f6; }
+.table { width:100%; border-collapse:collapse; }
+.table th, .table td { padding:10px 12px; border-bottom:1px solid #f1f4f6; }
+.table thead th { background:var(--primary-blue,#0d6efd); color:#fff; }
+.header-row.active { background:#f0f7ff; }
+.form-card { background:white; padding:20px; border-radius:12px; border:1px solid #eef3f6; }
+.label-sm { display:block; font-size:12px; font-weight:600; color:#6c757d; text-transform:uppercase; margin-bottom:6px; }
+.input-full { width:100%; padding:8px; box-sizing:border-box; }
+.alert { padding:12px 16px; border-radius:6px; margin-bottom:16px; }
+.alert.success { background:#e6f4ea; color:#1b5e20; border:1px solid #b7e1c7; }
+.alert.error { background:#fdecea; color:#7a1a14; border:1px solid #f5c2c0; }
+@media (max-width:1000px){ .txn-wrap{ flex-direction:column; } }
+
+/* Penerimaan-like table styling for headers/actions */
+.table.pengadaan-table { width:100%; table-layout: auto; border-collapse: collapse; box-sizing: border-box; }
+.table.pengadaan-table col { width: auto !important; }
+.table.pengadaan-table th, .table.pengadaan-table td { padding:10px 12px; font-size:14px; vertical-align: middle; box-sizing: border-box; }
+.table.pengadaan-table thead th { background: var(--primary-blue, #0d6efd); color:#fff; }
+.table.pengadaan-table th.numeric, .table.pengadaan-table td.numeric { text-align: right; white-space:nowrap; }
+.table.pengadaan-table td.idcol { width:60px; text-align: right; white-space:nowrap; }
+.table.pengadaan-table tr { border-bottom:1px solid #eee; }
+  .table.pengadaan-table td.actions-col { width:270px; text-align:right; white-space:nowrap; }
+.table.pengadaan-table .actions { display:flex; gap:8px; justify-content:flex-end; align-items:center; flex-wrap:nowrap; position:relative; z-index:1200; }
+.table.pengadaan-table .actions .btn { padding:8px 12px; font-size:13px; border-radius:6px; position:relative; z-index:1210; }
+.table.pengadaan-table tr { overflow: visible; }
+/* stretch header table to panel edges like penerimaan (compensate for panel padding) */
+.table.pengadaan-table { width:100%; table-layout: auto; border-collapse: collapse; box-sizing: border-box; }
+.table.pengadaan-table col { width: auto !important; }
+.table.pengadaan-table th, .table.pengadaan-table td { padding:10px 12px; font-size:14px; vertical-align: middle; box-sizing: border-box; }
+.table.pengadaan-table thead th { background: var(--primary-blue, #0d6efd); color:#fff; }
+.table.pengadaan-table th.numeric, .table.pengadaan-table td.numeric { text-align: right; white-space:nowrap; }
+.table.pengadaan-table td.idcol { width:60px; text-align: right; white-space:nowrap; }
+.table.pengadaan-table td.vendor, .table.pengadaan-table td.barang { white-space: normal; word-wrap:break-word; }
+.txn-left.txn-panel .table.pengadaan-table { margin-top:12px; }
+/* rounded blue header like penerimaan */
+.txn-left.txn-panel .table.pengadaan-table thead th:first-child{ border-top-left-radius:10px; }
+.txn-left.txn-panel .table.pengadaan-table thead th:last-child{ border-top-right-radius:10px; }
+/* keep table full-width inside panel like pengadaan/penerimaan */
+@media (max-width:1000px){ .txn-left.txn-panel .table.pengadaan-table { width:100%; margin-left:0; margin-right:0; } }
+/* status badge */
+.status-badge{display:inline-block;width:30px;height:30px;border-radius:50%;text-align:center;line-height:30px;font-weight:700}
+.status-badge.green{background:#e9f7ef;color:#1b5e20}
+.status-badge.gray{background:#f1f3f5;color:#6c757d}
+</style>
+
 <h1>Transaksi Penjualan</h1>
-<?php if ($message): ?><div class="card" style="background:#0b1220; padding:10px;"><?= htmlspecialchars($message) ?></div><?php endif; ?>
-<section>
-  <h2>Input Detail</h2>
-  <form method="post" class="inline">
-    <label>Margin Aktif<br>
+<?php if ($message):
+  $isError = (stripos($message,'gagal') !== false || stripos($message,'error') !== false);
+?>
+  <div class="alert <?= $isError ? 'error' : 'success' ?>"><?= htmlspecialchars($message) ?></div>
+<?php endif; ?>
+<section style="margin-bottom:16px">
+  <div class="txn-panel" style="padding:14px;">
+    <h3 style="margin-top:0">Tambah Penjualan</h3>
+    <form method="post" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <input type="hidden" name="action" value="create_header">
       <?php if(count($marginAktif) === 1): ?>
-        <div style="padding:6px 10px;background:#182235;border-radius:4px;display:inline-block;min-width:140px">
-          <?= (float)$marginAktif[0]['persen'] ?> % (auto)
-        </div>
-        <input type="hidden" name="idmargin_penjualan" value="<?= $marginAktif[0]['idmargin_penjualan'] ?>">
+        <input type="hidden" name="idmargin_penjualan" value="<?= (int)$marginAktif[0]['idmargin_penjualan'] ?>">
+        <div style="font-size:14px;color:#6c757d;padding:6px 10px;background:#f8fafc;border-radius:8px">Margin aktif: <?= (float)$marginAktif[0]['persen'] ?>%</div>
       <?php else: ?>
-        <select name="idmargin_penjualan" id="idmargin_penjualan">
-          <option value="">- pilih margin -</option>
-          <?php foreach($marginAktif as $m): ?>
-            <option value="<?= $m['idmargin_penjualan'] ?>" data-persen="<?= (float)$m['persen'] ?>">
-              <?= (float)$m['persen'] ?> %
-            </option>
-          <?php endforeach; ?>
-        </select>
+        <label style="margin:0">
+          <div style="font-size:12px;color:#6c757d;margin-bottom:6px">Margin</div>
+          <select name="idmargin_penjualan" style="padding:8px;border-radius:6px">
+            <option value="">- pilih margin -</option>
+            <?php foreach($marginAktif as $m): ?>
+              <option value="<?= $m['idmargin_penjualan'] ?>"><?= (float)$m['persen'] ?>%</option>
+            <?php endforeach; ?>
+          </select>
+        </label>
       <?php endif; ?>
-    </label>
-    <label>Barang<br>
-      <select name="idbarang" id="idbarang_penjualan" required>
-        <?php foreach($barang as $b): ?>
-          <option value="<?= $b['idbarang'] ?>" data-harga="<?= (int)$b['harga'] ?>">
-            <?= htmlspecialchars($b['nama_barang']) ?>
-          </option>
-        <?php endforeach; ?>
-      </select>
-    </label>
-    <label>Jumlah<br><input type="number" name="jumlah" min="1" required></label>
-    <label>Harga Satuan<br><input type="number" name="harga_satuan" id="harga_satuan_penjualan" min="0" required></label>
-    <button class="btn">Simpan</button>
-  </form>
+      <div style="flex:1"></div>
+      <button class="btn" type="submit">Tambah Penjualan</button>
+    </form>
+  </div>
 </section>
+<!-- preview, input detail, and detail table removed per request; keep only header creation and header list -->
+
+<!-- Headers panel placed below the input/preview area to match penerimaan/pengadaan layout -->
+    <div style="margin-top:12px;">
+    <table class="table pengadaan-table">
+      <colgroup>
+        <col style="width:60px">
+        <col style="width:180px">
+        <col style="width:140px">
+        <col style="width:100px">
+        <col style="width:110px">
+        <col style="width:80px">
+        <col style="width:270px">
+      </colgroup>
+      <thead>
+        <tr>
+          <th class="idcol">ID</th>
+          <th class="tanggal">TANGGAL</th>
+          <th class="kasir">KASIR</th>
+          <th class="numeric">MARGIN %</th>
+          <th class="numeric">TOTAL</th>
+          <th>STATUS</th>
+          <th>Aksi</th>
+        </tr>
+      </thead>
+      <tbody>
+      <?php foreach($headersAll as $h):
+        $hid = $h['idpenjualan'] ?? '';
+        $status = isset($h['status']) ? strtoupper(trim($h['status'])) : '';
+        $tanggal = $h['created_at'] ?? $h['tanggal_penjualan'] ?? '-';
+        $kasir = $h['username'] ?? $h['kasir'] ?? $h['nama_kasir'] ?? '-';
+        $marginVal = isset($h['margin_persen']) ? $h['margin_persen'] : (isset($h['persen']) ? $h['persen'] : null);
+        $totalVal = isset($h['total_nilai']) ? (int)$h['total_nilai'] : 0;
+      ?>
+      <tr class="header-row <?= ($status === 'F') ? 'active' : '' ?>">
+        <td class="idcol"><?= $hid ? htmlspecialchars($hid) : '' ?></td>
+        <td class="tanggal"><?= htmlspecialchars($tanggal) ?></td>
+        <td class="kasir"><?= htmlspecialchars($kasir) ?></td>
+        <td class="numeric"><?= $marginVal !== null ? htmlspecialchars((string)$marginVal) . ' %' : '-' ?></td>
+        <td class="numeric"><?= number_format($totalVal) ?></td>
+        <td>
+          <?php
+            $badgeClass = 'gray';
+            if ($status === 'F') { $badgeClass = 'green'; }
+          ?>
+          <span class="status-badge <?= $badgeClass ?>"><?= $status ? htmlspecialchars($status) : '-' ?></span>
+        </td>
+        <td class="actions-col">
+          <div class="actions">
+            <a class="btn" href="penjualan_add.php?idpenjualan=<?= $hid ?>">Lihat</a>
+            <form method="post" style="display:inline-block">
+              <input type="hidden" name="action" value="update_status">
+              <input type="hidden" name="idpenjualan" value="<?= $hid ?>">
+              <select name="to_status">
+                <option value="A" <?= (($h['status'] ?? '')=='A') ? 'selected' : '' ?>>A</option>
+                <option value="P" <?= (($h['status'] ?? '')=='P') ? 'selected' : '' ?>>P</option>
+                <option value="F" <?= (($h['status'] ?? '')=='F') ? 'selected' : '' ?>>F</option>
+              </select>
+              <button class="btn secondary">Ubah</button>
+            </form>
+            <form method="post" onsubmit="return confirm('Apakah Anda yakin ingin menghapus Penjualan #<?= $hid ?>?');" style="display:inline-block;margin-left:6px">
+              <input type="hidden" name="action" value="delete_penjualan">
+              <input type="hidden" name="idpenjualan" value="<?= $hid ?>">
+              <button class="btn danger">Hapus</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+    </div>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
 <script>
+// Minimal JS: auto-select first margin option for convenience
 document.addEventListener('DOMContentLoaded', function(){
-  // Auto-select first active margin if select exists and empty
   const marginSel = document.getElementById('idmargin_penjualan');
   if(marginSel && !marginSel.value){
     const firstOpt = Array.from(marginSel.options).find(o => o.value !== '');
     if(firstOpt){ marginSel.value = firstOpt.value; }
   }
-  // Auto-fill harga satuan saat pilih barang
-  const barangSel = document.getElementById('idbarang_penjualan');
-  const hargaInput = document.getElementById('harga_satuan_penjualan');
-  function applyHarga(){
-    if(!barangSel || !hargaInput) return;
-    const opt = barangSel.selectedOptions[0];
-    const h = opt ? parseInt(opt.dataset.harga || '0') : 0;
-    hargaInput.value = h || '';
-  }
-  if(barangSel){
-    barangSel.addEventListener('change', applyHarga);
-    applyHarga(); // initial fill
-  }
 });
 </script>
-<section>
-  <h2>Header Penjualan (v_penjualanheader)</h2>
-  <?php if($activeId && $currentHeader): ?>
-    <h3 style="margin-top:10px">Sedang Dikerjakan (ID #<?= $activeId ?>)</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Tanggal</th><th>Kasir</th><th>Margin</th><th>Total</th></tr></thead>
-      <tbody>
-        <?php foreach($currentHeader as $h): ?>
-          <tr style="background:#182235">
-            <td><?= $h['idpenjualan'] ?></td>
-            <td><?= $h['tanggal_penjualan'] ?></td>
-            <td><?= htmlspecialchars($h['kasir']) ?></td>
-            <td><?= (float)$h['margin_persen'] ?>%</td>
-            <td><?= number_format($h['total_nilai']) ?></td>
-          </tr>
-        <?php endforeach; ?>
-      </tbody>
-    </table>
-    <h3 style="margin-top:24px">Riwayat / Lainnya</h3>
-  <?php endif; ?>
-  <table class="table">
-    <thead><tr><th>ID</th><th>Tanggal</th><th>Kasir</th><th>Margin</th><th>Total</th></tr></thead>
-    <tbody>
-      <?php foreach($otherHeaders as $h): ?>
-        <tr>
-          <td><a href="?idpenjualan=<?= $h['idpenjualan'] ?>"><?= $h['idpenjualan'] ?></a></td>
-          <td><?= $h['tanggal_penjualan'] ?></td>
-          <td><?= htmlspecialchars($h['kasir']) ?></td>
-          <td><?= (float)$h['margin_persen'] ?>%</td>
-          <td><?= number_format($h['total_nilai']) ?></td>
-        </tr>
-      <?php endforeach; ?>
-    </tbody>
-  </table>
-</section>
-<section>
-  <h2>Detail Penjualan (v_detailpenjualanlengkap)</h2>
-  <table class="table">
-    <thead><tr><th>ID Detail</th><th>ID Penjualan</th><th>Barang</th><th>Jumlah</th><th>Harga</th><th>Subtotal</th></tr></thead>
-    <tbody>
-      <?php foreach($details as $d): ?>
-        <tr>
-          <td><?= $d['iddetail_penjualan'] ?></td>
-          <td><?= $d['idpenjualan'] ?></td>
-          <td><?= htmlspecialchars($d['nama_barang']) ?></td>
-          <td><?= $d['jumlah'] ?></td>
-          <td><?= number_format($d['harga_satuan']) ?></td>
-          <td><?= number_format($d['sub_total']) ?></td>
-        </tr>
-      <?php endforeach; ?>
-    </tbody>
-  </table>
-</section>
 <?php
 $content = ob_get_clean();
 include __DIR__ . '/../../views/template.php';

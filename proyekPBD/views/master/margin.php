@@ -1,5 +1,6 @@
 <?php
-session_start();
+if (session_status() !== PHP_SESSION_ACTIVE) { session_start(); }
+// session started centrally in views/template.php
 require_once __DIR__ . '/../../config/Database.php';
 require_once __DIR__ . '/../../config/AppConfig.php';
 require_once __DIR__ . '/../../models/BaseModel.php';

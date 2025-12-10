@@ -12,7 +12,7 @@ class DataFetcher {
     public function roles(): array { return $this->db->fetchAll('SELECT * FROM v_roleall ORDER BY nama_role'); }
     public function users(): array { return $this->db->fetchAll('SELECT * FROM v_userall ORDER BY username'); }
     public function vendorsAktif(): array { return $this->db->fetchAll("SELECT * FROM v_vendoraktif ORDER BY nama_vendor"); }
-    public function pengadaanHeader(): array { return $this->db->fetchAll("SELECT * FROM v_pengadaanheader ORDER BY tanggal_pengadaan DESC"); }
+    public function pengadaanHeader(): array { return $this->db->fetchAll("SELECT * FROM v_pengadaanheader ORDER BY tanggal_pengadaan DESC"); }    
     public function penjualanHeader(): array { return $this->db->fetchAll("SELECT * FROM v_penjualanheader ORDER BY tanggal_penjualan DESC"); }
     public function penerimaanHeader(): array { return $this->db->fetchAll("SELECT * FROM v_penerimaanheader ORDER BY tanggal_terima DESC"); }
     public function stokSummary(): array { return $this->db->fetchAll('SELECT * FROM v_stoksummary ORDER BY nama_barang'); }

@@ -1,8 +1,10 @@
 <?php
-session_start();
 require_once __DIR__ . '/config/Database.php';
 require_once __DIR__ . '/config/AppConfig.php';
 require_once __DIR__ . '/controllers/AuthController.php';
+
+// Ensure session is started so AuthController can write to $_SESSION
+if (session_status() !== PHP_SESSION_ACTIVE) { session_start(); }
 
 $auth = new AuthController(Database::getInstance());
 $error = '';
@@ -22,6 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 ?>
+
 <!DOCTYPE html>
 <html lang="id">
 <head>

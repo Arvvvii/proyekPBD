@@ -78,7 +78,6 @@ UPDATE user SET password = '$2y$10$QGr3Kuz9t6LQ70ZZ.eTtL.HaMgAvK7g1.3H68KBtLop93
 - Untuk produksi: pindah kredensial ke file `.env` atau environment server.
 
 ## Next Steps (Opsional)
-- Tambah modul Retur Barang memakai view terkait.
 - Logging aktivitas user.
 - Pagination & pencarian server-side.
 - Unit test dengan Pest / PHPUnit.

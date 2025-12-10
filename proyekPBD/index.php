@@ -1,8 +1,9 @@
 <?php
-session_start();
 require_once __DIR__ . '/config/Database.php';
 require_once __DIR__ . '/config/AppConfig.php';
 require_once __DIR__ . '/utilities/DataFetcher.php';
+// Ensure session is started before checking session variables
+if (session_status() !== PHP_SESSION_ACTIVE) { session_start(); }
 
 if(!isset($_SESSION['user_id'])) {
   header('Location: ' . BASE_PATH . '/login.php');

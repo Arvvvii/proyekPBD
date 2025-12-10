@@ -33,7 +33,6 @@ Proyek ini menekankan:
 | Stok | `v_stoksummary` | (kartu stok per gerak) | Ringkas saldo terakhir per barang |
 
 > Catatan: `v_kartustok` belum ada; kode menyiapkan fallback join.
-> Retur belum memakai VIEW khusus (langsung JOIN).
 
 ### Stored Procedures
 | Nama SP | Tujuan | Dipakai di Kode |
@@ -98,8 +97,7 @@ Form Penerimaan -> CALL sp_insert_penerimaan_lengkap -> INSERT header & detail
 6. Penjualan:
    - Tambah penjualan -> SP + FN + Trigger bekerja.
    - Refresh header penjualan dan stok.
-7. Retur:
-   - Catat retur (belum view khusus) – jelaskan improvement.
+
 
 ---
 ## 5. Keunggulan Desain
@@ -130,7 +128,6 @@ Pastikan hak akses DEFINER dan SECURITY DEFINER tetap sesuai (default root@local
 | Bedanya SP dan Trigger? | SP dipanggil eksplisit; Trigger otomatis jalan pada event tabel. |
 | Bagaimana jaga stok? | Insert detail transaksi memicu trigger update kartu_stok + validasi stok. |
 | Kenapa ada fallback di pengadaan? | Menjaga user flow walau SP belum dibuat; rencana konsolidasi. |
-| Apa risiko tanpa trigger retur? | Stok tidak berkurang balik saat retur; perlu trigger atau prosedur tambahan. |
 | Mengapa FN_HitungTotalPenjualan dipakai? | Konsisten hitung total + PPN di server side, menghindari duplikasi logic. |
 | Apakah ini mencegah SQL Injection? | Parameterized PDO prepared statements digunakan untuk semua input. |
 
@@ -138,8 +135,6 @@ Pastikan hak akses DEFINER dan SECURITY DEFINER tetap sesuai (default root@local
 ## 8. Rencana Perbaikan (Next Steps)
 1. Tambahkan SP pengadaan detail (`sp_InsertDetailPengadaan`) dan total (`SP_UpdatePengadaanTotals`) atau ubah kode agar pakai `sp_insert_pengadaan_lengkap`.
 2. Buat VIEW `v_kartustok` agar konsisten read-only ledger.
-3. Buat VIEW untuk retur (header + detail) agar seragam.
-4. Tambah trigger retur untuk mengembalikan stok (jenis transaksi 'R').
 5. Index tambahan: periksa kebutuhan index di kolom filter umum (status, idbarang).
 6. Audit hak akses: gunakan user DB khusus dengan hak SELECT/EXECUTE minimal.
 7. Tambahkan logging transaksi (table log atau event sourcing ringan).
@@ -163,3 +158,52 @@ SELECT * FROM v_stoksummary;
 Struktur ini menunjukkan pemisahan jelas antara lapisan presentasi (PHP), abstraksi data (VIEW), logika bisnis terpusat (SP/FN), dan integritas otomatis (Trigger). Perbaikan lanjutan akan memantapkan konsistensi dan audit.
 
 Selamat presentasi! 👍
+
+---
+## Lampiran: Mengaktifkan / Menonaktifkan PPN (PPN toggle)
+
+Jika Anda ingin mengaktifkan kembali perhitungan PPN (PPN = Pajak Pertambahan Nilai) di sisi database dan aplikasi, ikuti langkah singkat di bawah ini.
+
+1) Konfirmasi konfigurasi aplikasi
+- `config/AppConfig.php` memiliki dua konstanta:
+   - `TAX_ENABLED` (boolean) — set `true` untuk menampilkan dan menghitung PPN di UI.
+   - `TAX_RATE` (float) — contoh `0.10` untuk 10%.
+
+2) Jalankan patch SQL pada database (patch sudah dibuat di repo sebagai `update_penjualan_enable_ppn.sql`)
+- Jalankan dari PowerShell (sesuaikan user/password/db):
+
+```powershell
+mysql -u root -p -D proyekpbd < "C:\laragon\www\proyekpbdd\proyekPBD\update_penjualan_enable_ppn.sql"
+```
+
+Atau masuk ke mysql prompt lalu source:
+
+```powershell
+mysql -u root -p
+-- di mysql prompt:
+USE proyekpbd;
+SOURCE C:/laragon/www/proyekpbdd/proyekPBD/update_penjualan_enable_ppn.sql;
+```
+
+3) Validasi singkat setelah patch
+- Panggil prosedur untuk salah satu header penjualan:
+
+```sql
+CALL SP_UpdateHeaderPenjualan(<idpenjualan>);
+SELECT idpenjualan, subtotal_nilai, ppn, total_nilai FROM penjualan WHERE idpenjualan = <idpenjualan>;
+```
+
+4) UI: preview & display
+- Setelah `TAX_ENABLED=true` aplikasi akan:
+   - Menampilkan preview Subtotal/PPN/Total di form penjualan (client-side preview).
+   - Menampilkan kolom Subtotal/PPN/Total pada tabel header penjualan (jika view `v_penjualanheader` menyertakan kolom ini).
+
+5) Catatan sinkronisasi nilai PPN
+- Patch SQL menetapkan PPN di level SP ke 10% (hard-coded). Untuk membuatnya dinamis, pertimbangkan:
+   - Menyimpan `tax_rate` di tabel `settings` dan mengubah SP untuk membaca nilai tersebut.
+   - Atau menjaga `TAX_RATE` di `AppConfig.php` dan lakukan perhitungan di PHP sebelum memanggil SP (kurang ideal jika ada akses DB lain).
+
+6) Rollback / Alternatif
+- Jika sebelumnya Anda menjalankan `update_penjualan_tanpa_ppn.sql` (tanpa PPN), dan ingin rollback, gunakan `update_penjualan_enable_ppn.sql` yang ada di repo (ini menggantikan FN/SP).
+
+---

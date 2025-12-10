@@ -22,59 +22,76 @@ if(isset($_SESSION['flash_pengadaan'])){
 
 if($_SERVER['REQUEST_METHOD']==='POST') {
   $action = $_POST['action'] ?? '';
-  if ($action === 'create_header') {
+    if ($action === 'create_header') {
     $iduser = (int)$_SESSION['user_id'];
     $vendor_id = (int)$_POST['vendor_idvendor'];
     $status = 'A'; // auto aktif
     try {
+      // Gunakan transaksi agar header tidak tersimpan sebagian jika terjadi error
+      $db->beginTransaction();
       $db->execute('INSERT INTO pengadaan (user_iduser, status, vendor_idvendor, subtotal_nilai, ppn, total_nilai) VALUES (?,?,?,?,?,?)',
         [$iduser, $status, $vendor_id, 0, 0, 0]);
       $newId = (int)$db->getConnection()->lastInsertId();
-      header('Location: ' . BASE_PATH . '/views/transaksi/pengadaan.php?idpengadaan=' . $newId);
+      $db->commit();
+      // Setelah membuat header, langsung buka halaman detail pengadaan
+      header('Location: ' . BASE_PATH . '/views/transaksi/pengadaan_detail.php?id=' . $newId);
       exit;
     } catch (Throwable $e) {
+      try { $db->rollBack(); } catch (Throwable $_) {}
       $message = 'Gagal membuat header: ' . $e->getMessage();
     }
   } elseif ($action === 'add_detail') {
     $idpengadaan = (int)$_POST['idpengadaan'];
-    $idbarang = (int)$_POST['idbarang'];
-    $jumlah = (int)$_POST['jumlah_pesan'];
-    $harga = (int)$_POST['harga_satuan'];
-    $sub = $jumlah * $harga;
-    try {
-      // Tambah detail via Stored Procedure utama
-      // Asumsi utama signature: (idpengadaan, idbarang, jumlah, harga_satuan)
+    // Periksa apakah pengadaan sudah final
+    $hdrCheck = $db->fetch('SELECT status FROM pengadaan WHERE idpengadaan = ? LIMIT 1', [$idpengadaan]);
+    if ($hdrCheck && ($hdrCheck['status'] ?? '') === 'F') {
+      $message = 'Pengadaan sudah final. Tidak dapat menambah detail.';
+    } else {
+      $idbarang = (int)$_POST['idbarang'];
+      $jumlah = (int)$_POST['jumlah_pesan'];
+      $harga = (int)$_POST['harga_satuan'];
+      $sub = $jumlah * $harga;
       try {
-        $db->callProcedure('sp_InsertDetailPengadaan', [ $idpengadaan, $idbarang, $jumlah, $harga ]);
-      } catch (Throwable $sig4Err) {
-        // Coba varian dengan parameter subtotal bila SP mengharuskan
+        // Mulai transaksi agar insert detail + update total bersifat atomik
+        $db->beginTransaction();
+        // Tambah detail via Stored Procedure utama
+        // Asumsi utama signature: (idpengadaan, idbarang, jumlah, harga_satuan)
         try {
-          $db->callProcedure('sp_InsertDetailPengadaan', [ $idpengadaan, $idbarang, $jumlah, $harga, $sub ]);
-        } catch (Throwable $sig5Err) {
-          // Fallback terakhir: direct SQL supaya proses user tidak terblokir
-          $db->execute('INSERT INTO detail_pengadaan (idpengadaan, idbarang, jumlah, harga_satuan, sub_total) VALUES (?,?,?,?,?)',
-            [$idpengadaan, $idbarang, $jumlah, $harga, $sub]);
+          $db->callProcedure('sp_InsertDetailPengadaan', [ $idpengadaan, $idbarang, $jumlah, $harga ]);
+        } catch (Throwable $sig4Err) {
+          // Coba varian dengan parameter subtotal bila SP mengharuskan
+          try {
+            $db->callProcedure('sp_InsertDetailPengadaan', [ $idpengadaan, $idbarang, $jumlah, $harga, $sub ]);
+          } catch (Throwable $sig5Err) {
+            // Fallback terakhir: direct SQL supaya proses user tidak terblokir
+            $db->execute('INSERT INTO detail_pengadaan (idpengadaan, idbarang, jumlah, harga_satuan, sub_total) VALUES (?,?,?,?,?)',
+              [$idpengadaan, $idbarang, $jumlah, $harga, $sub]);
+          }
         }
-      }
 
-      // Sinkronisasi total header melalui Stored Procedure baru.
-      // Utama: CALL SP_UpdatePengadaanTotals(idpengadaan)
-      try {
-        $db->callProcedure('SP_UpdatePengadaanTotals', [ $idpengadaan ]);
-      } catch (Throwable $spErr) {
-        // Fallback jika SP belum tersedia: hitung manual agar tidak memblokir operasi.
-        $sum = $db->fetch('SELECT SUM(sub_total) AS subtotal FROM detail_pengadaan WHERE idpengadaan = ?', [$idpengadaan]);
-        $subtotal = (int)($sum['subtotal'] ?? 0);
-        $ppn = (int)round($subtotal * 0.11);
-        $total = $subtotal + $ppn;
-        $db->execute('UPDATE pengadaan SET subtotal_nilai=?, ppn=?, total_nilai=? WHERE idpengadaan=?', [$subtotal,$ppn,$total,$idpengadaan]);
+        // Sinkronisasi total header melalui Stored Procedure baru.
+        // Utama: CALL SP_UpdatePengadaanTotals(idpengadaan)
+        try {
+          $db->callProcedure('SP_UpdatePengadaanTotals', [ $idpengadaan ]);
+        } catch (Throwable $spErr) {
+          // Fallback jika SP belum tersedia: hitung manual agar tidak memblokir operasi.
+          $sum = $db->fetch('SELECT SUM(sub_total) AS subtotal FROM detail_pengadaan WHERE idpengadaan = ?', [$idpengadaan]);
+          $subtotal = (int)($sum['subtotal'] ?? 0);
+          $ppn = (int)round($subtotal * 0.11);
+          $total = $subtotal + $ppn;
+          $db->execute('UPDATE pengadaan SET subtotal_nilai=?, ppn=?, total_nilai=? WHERE idpengadaan=?', [$subtotal,$ppn,$total,$idpengadaan]);
+        }
+
+        // Commit jika semua sukses
+        $db->commit();
+        // PRG: setelah simpan detail, tetap berada pada header aktif agar user bisa menambah item berikutnya
+        $_SESSION['flash_pengadaan'] = 'Detail ditambahkan.';
+        header('Location: ' . BASE_PATH . '/views/transaksi/pengadaan.php?idpengadaan=' . $idpengadaan . '#formAddDetail');
+        exit;
+      } catch (Throwable $e) {
+        try { $db->rollBack(); } catch (Throwable $_) {}
+        $message = 'Gagal menambah detail: ' . $e->getMessage();
       }
-  // PRG: setelah simpan detail, tetap berada pada header aktif agar user bisa menambah item berikutnya
-  $_SESSION['flash_pengadaan'] = 'Detail ditambahkan.';
-  header('Location: ' . BASE_PATH . '/views/transaksi/pengadaan.php?idpengadaan=' . $idpengadaan . '#formAddDetail');
-      exit;
-    } catch (Throwable $e) {
-      $message = 'Gagal menambah detail: ' . $e->getMessage();
     }
   } elseif ($action === 'update_status') {
     $idpengadaan = (int)$_POST['idpengadaan'];
@@ -85,6 +102,37 @@ if($_SERVER['REQUEST_METHOD']==='POST') {
       $activeId = $idpengadaan;
     } catch (Throwable $e) {
       $message = 'Gagal update status: ' . $e->getMessage();
+    }
+  } elseif ($action === 'delete_pengadaan') {
+    $idpengadaan = (int)($_POST['idpengadaan'] ?? 0);
+    if ($idpengadaan <= 0) {
+      $message = 'ID Pengadaan tidak valid.';
+    } else {
+      try {
+        // Cek adanya relasi yang mencegah penghapusan
+        $cntDetail = $db->fetch('SELECT COUNT(*) AS c FROM detail_pengadaan WHERE idpengadaan = ?', [$idpengadaan]);
+        $cntPenerimaan = $db->fetch('SELECT COUNT(*) AS c FROM penerimaan WHERE idpengadaan = ?', [$idpengadaan]);
+        $hasDetail = (int)($cntDetail['c'] ?? 0) > 0;
+        $hasPenerimaan = (int)($cntPenerimaan['c'] ?? 0) > 0;
+        if ($hasDetail || $hasPenerimaan) {
+          $message = 'Tidak dapat menghapus: pengadaan memiliki detail atau penerimaan terkait. Hapus detail/penerimaan terlebih dahulu.';
+        } else {
+          // aman untuk menghapus header
+          try {
+            $db->beginTransaction();
+            $db->execute('DELETE FROM pengadaan WHERE idpengadaan = ?', [$idpengadaan]);
+            $db->commit();
+            $_SESSION['flash_pengadaan'] = 'Pengadaan #' . $idpengadaan . ' berhasil dihapus.';
+            header('Location: ' . BASE_PATH . '/views/transaksi/pengadaan.php');
+            exit;
+          } catch (Throwable $eDel) {
+            try { $db->rollBack(); } catch (Throwable $_) {}
+            throw $eDel;
+          }
+        }
+      } catch (Throwable $e) {
+        $message = 'Gagal menghapus pengadaan: ' . $e->getMessage();
+      }
     }
   }
 }
@@ -103,8 +151,28 @@ $details = $db->fetchAll('SELECT * FROM v_detailpengadaanlengkap ORDER BY idpeng
 $title='Transaksi Pengadaan';
 ob_start();
 ?>
+<style>
+/* Page-specific pengadaan table styling */
+.txn-wrap { display:flex; gap:20px; align-items:flex-start; }
+.txn-left { flex: 1 1 auto; }
+.table.pengadaan-table { width:100%; table-layout: fixed; border-collapse: collapse; }
+.table.pengadaan-table th, .table.pengadaan-table td { padding:10px 12px; font-size:14px; vertical-align: middle; }
+.table.pengadaan-table thead th { background: var(--primary-blue, #0d6efd); color:#fff; }
+.table.pengadaan-table th.numeric, .table.pengadaan-table td.numeric { text-align: right; white-space:nowrap; }
+.table.pengadaan-table td.idcol { width:60px; text-align: right; white-space:nowrap; }
+.table.pengadaan-table td.vendor { white-space: normal; min-width:220px; max-width:420px; word-wrap:break-word; }
+.table.pengadaan-table td.status { text-align: center; }
+.table.pengadaan-table tr { border-bottom:1px solid #eee; }
+.table.pengadaan-table td.actions-col { width:270px; text-align: right; white-space:nowrap; }
+.table.pengadaan-table .actions { display:flex; gap:8px; justify-content:flex-end; align-items:center; flex-wrap:nowrap; }
+.table.pengadaan-table .actions .btn { padding:8px 12px; font-size:13px; border-radius:6px; }
+.table.pengadaan-table .status-badge { display:inline-block; width:30px; height:30px; line-height:30px; border-radius:50%; font-size:13px; }
+@media (max-width:1100px){ .txn-wrap{ flex-direction:column; } .table.pengadaan-table td.vendor{ min-width:auto; } }
+</style>
+<?php
+?>
 <h1>Transaksi Pengadaan</h1>
-<?php if($message): ?><div class="card" style="background:#0b1220;padding:10px;"><?= htmlspecialchars($message) ?></div><?php endif; ?>
+<?php if($message): ?><div class="card" style="padding:16px; background:#D1ECF1; color:#0C5460; border:2px solid #BEE5EB; margin-bottom:20px;"><?= htmlspecialchars($message) ?></div><?php endif; ?>
 <section>
   <h2>Tambah Pengadaan</h2>
   <form method="post" class="inline">
@@ -120,97 +188,65 @@ ob_start();
   </form>
 </section>
 
-<?php if ($activeId): ?>
-<section>
-  <h2>Tambah Detail untuk #<?= $activeId ?></h2>
-  <form id="formAddDetail" method="post" class="inline" oninput="calcSubTotal()" onsubmit="return lockSubmit(this)" autocomplete="off">
-    <input type="hidden" name="action" value="add_detail">
-    <input type="hidden" name="idpengadaan" value="<?= $activeId ?>">
-    <label>Barang<br>
-      <select name="idbarang" required>
-        <?php foreach($barang as $b): ?>
-          <option value="<?= $b['idbarang'] ?>" data-harga="<?= (int)$b['harga'] ?>"><?= htmlspecialchars($b['nama_barang']) ?></option>
+<!-- Pada halaman utama hanya tampilkan tombol tambah dan daftar header. Detail ditangani di halaman terpisah. -->
+<div class="txn-wrap">
+  <div class="txn-left txn-panel">
+    <h3>Header Pengadaan</h3>
+    <div style="margin-top:12px;">
+      <table class="table pengadaan-table">
+        <colgroup>
+          <col style="width:60px">
+          <col style="width:180px">
+          <col style="width:45%">
+          <col style="width:80px">
+          <col style="width:110px">
+          <col style="width:200px">
+        </colgroup>
+        <thead>
+          <tr>
+            <th class="idcol">ID</th>
+            <th class="tanggal">TANGGAL</th>
+            <th class="vendor">VENDOR</th>
+            <th class="status">STATUS</th>
+            <th class="numeric">TOTAL</th>
+            <th>Aksi</th>
+          </tr>
+        </thead>
+        <tbody>
+        <?php foreach(array_merge($currentHeader, $otherHeaders) as $h): ?>
+          <tr style="<?= (isset($h['idpengadaan']) && $h['idpengadaan']==$activeId) ? 'background:#E9F5FF;border-left:4px solid var(--primary-blue);' : '' ?>">
+            <td class="idcol"><?= $h['idpengadaan'] ?></td>
+            <td class="tanggal"><?= $h['tanggal_pengadaan'] ?></td>
+            <td class="vendor"><?= htmlspecialchars($h['nama_vendor']) ?></td>
+            <td class="status"><span class="status-badge status-<?= htmlspecialchars($h['status'] ?? '0') ?>"><?= htmlspecialchars($h['status'] ?? '-') ?></span></td>
+            <td class="numeric"><?= isset($h['total_nilai']) ? number_format((float)$h['total_nilai']) : '0' ?></td>
+            <td class="actions-col">
+              <div class="actions">
+                <a class="btn" href="?idpengadaan=<?= $h['idpengadaan'] ?>" onclick="window.location='pengadaan_detail.php?id='+<?= $h['idpengadaan'] ?>; return false;">Lihat</a>
+                <form method="post" style="display:inline-block">
+                  <input type="hidden" name="action" value="update_status">
+                  <input type="hidden" name="idpengadaan" value="<?= $h['idpengadaan'] ?>">
+                  <select name="to_status">
+                    <option value="A" <?= ($h['status']=='A')?'selected':'' ?>>A</option>
+                    <option value="P" <?= ($h['status']=='P')?'selected':'' ?>>P</option>
+                  </select>
+                  <button class="btn secondary">Ubah</button>
+                </form>
+                <form method="post" onsubmit="return confirm('Apakah Anda yakin ingin menghapus Pengadaan #<?= $h['idpengadaan'] ?>?');" style="display:inline-block;margin-left:6px">
+                  <input type="hidden" name="action" value="delete_pengadaan">
+                  <input type="hidden" name="idpengadaan" value="<?= $h['idpengadaan'] ?>">
+                  <button class="btn danger">Hapus</button>
+                </form>
+              </div>
+            </td>
+          </tr>
         <?php endforeach; ?>
-      </select>
-    </label>
-    <label>Jumlah<br><input type="number" name="jumlah_pesan" min="1" required></label>
-    <label>Harga Satuan<br><input type="number" name="harga_satuan" id="harga_satuan" min="0" required></label>
-    <label>Sub Total (auto)<br><input type="number" name="sub_total_preview" readonly></label>
-    <button class="btn" type="submit" id="btnSubmitDetail">Simpan Detail</button>
-  </form>
-</section>
-<?php endif; ?>
-<section>
-  <h2>Header Pengadaan (v_pengadaanheader)</h2>
-  <?php if($activeId && $currentHeader): ?>
-    <h3 style="margin-top:10px">Sedang Dikerjakan (ID #<?= $activeId ?>)</h3>
-    <table class="table"><thead><tr><th>ID</th><th>Tanggal</th><th>Vendor</th><th>Dibuat Oleh</th><th>Status</th><th>Total Nilai</th><th>Aksi</th></tr></thead><tbody>
-      <?php foreach($currentHeader as $h): ?>
-        <tr style="background:#182235">
-          <td><?= $h['idpengadaan'] ?></td>
-          <td><?= $h['tanggal_pengadaan'] ?></td>
-          <td><?= htmlspecialchars($h['nama_vendor']) ?></td>
-          <td><?= htmlspecialchars($h['dibuat_oleh']) ?></td>
-          <td><?= htmlspecialchars($h['status']) ?></td>
-          <td><?= isset($h['total_nilai']) ? number_format((float)$h['total_nilai']) : '0' ?></td>
-          <td>
-            <a class="btn secondary" href="?idpengadaan=<?= $h['idpengadaan'] ?>#formAddDetail" style="margin-right:6px">Tambah Detail</a>
-            <form method="post" class="inline" style="display:inline-flex;gap:6px">
-              <input type="hidden" name="action" value="update_status">
-              <input type="hidden" name="idpengadaan" value="<?= $h['idpengadaan'] ?>">
-              <select name="to_status">
-                <option value="A" <?= $h['status']=='A'?'selected':'' ?>>Aktif</option>
-                <option value="P" <?= $h['status']=='P'?'selected':'' ?>>Pending</option>
-              </select>
-              <button class="btn secondary">Ubah</button>
-            </form>
-          </td>
-        </tr>
-      <?php endforeach; ?>
-    </tbody></table>
-    <h3 style="margin-top:24px">Riwayat / Lainnya</h3>
-  <?php endif; ?>
-  <table class="table"><thead><tr><th>ID</th><th>Tanggal</th><th>Vendor</th><th>Dibuat Oleh</th><th>Status</th><th>Total Nilai</th><th>Aksi</th></tr></thead><tbody>
-    <?php foreach($otherHeaders as $h): ?>
-      <tr>
-        <td><?= $h['idpengadaan'] ?></td>
-        <td><?= $h['tanggal_pengadaan'] ?></td>
-        <td><?= htmlspecialchars($h['nama_vendor']) ?></td>
-        <td><?= htmlspecialchars($h['dibuat_oleh']) ?></td>
-        <td><?= htmlspecialchars($h['status']) ?></td>
-        <td><?= isset($h['total_nilai']) ? number_format((float)$h['total_nilai']) : '0' ?></td>
-        <td>
-          <a class="btn secondary" href="?idpengadaan=<?= $h['idpengadaan'] ?>#formAddDetail" style="margin-right:6px">Tambah Detail</a>
-          <form method="post" class="inline" style="display:inline-flex;gap:6px">
-            <input type="hidden" name="action" value="update_status">
-            <input type="hidden" name="idpengadaan" value="<?= $h['idpengadaan'] ?>">
-            <select name="to_status">
-              <option value="A" <?= $h['status']=='A'?'selected':'' ?>>Aktif</option>
-              <option value="P" <?= $h['status']=='P'?'selected':'' ?>>Pending</option>
-            </select>
-            <button class="btn secondary">Ubah</button>
-          </form>
-        </td>
-      </tr>
-    <?php endforeach; ?>
-  </tbody></table>
-</section>
-<section>
-  <h2>Detail Pengadaan (v_detailpengadaanlengkap)</h2>
-  <table class="table"><thead><tr><th>ID Detail</th><th>ID Pengadaan</th><th>Barang</th><th>Satuan</th><th>Jumlah</th><th>Harga</th><th>Subtotal</th></tr></thead><tbody>
-    <?php foreach($details as $d): ?>
-      <tr>
-        <td><?= $d['iddetail_pengadaan'] ?></td>
-        <td><?= $d['idpengadaan'] ?></td>
-        <td><?= htmlspecialchars($d['nama_barang']) ?></td>
-        <td><?= htmlspecialchars($d['nama_satuan']) ?></td>
-        <td><?= $d['jumlah_pesan'] ?></td>
-        <td><?= isset($d['harga_satuan']) ? number_format((float)$d['harga_satuan']) : '0' ?></td>
-        <td><?= isset($d['sub_total']) ? number_format((float)$d['sub_total']) : '0' ?></td>
-      </tr>
-    <?php endforeach; ?>
-  </tbody></table>
-</section>
+      </tbody></table>
+    </div>
+  </div>
+
+  <!-- Ringkasan dipindahkan ke halaman detail; di halaman utama hanya daftar header ditampilkan. -->
+</div>
 <script>
 function calcSubTotal(){
   const form=document.getElementById('formAddDetail');

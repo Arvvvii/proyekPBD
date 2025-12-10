@@ -1,7 +1,7 @@
 <?php
 // Endpoint AJAX untuk memuat daftar barang yang masih outstanding (belum semua diterima) pada suatu pengadaan
 // Mengembalikan JSON: [ { idbarang, nama_barang, ordered_qty, received_qty, outstanding_qty } ]
-session_start();
+if (session_status() !== PHP_SESSION_ACTIVE) { session_start(); }
 require_once __DIR__ . '/../../config/Database.php';
 require_once __DIR__ . '/../../config/AppConfig.php';
 
@@ -17,6 +17,7 @@ try {
     $sql = "SELECT dp.idbarang,
                    b.nama AS nama_barang,
                    dp.jumlah AS ordered_qty,
+                   dp.harga_satuan AS harga_satuan,
                    COALESCE( (
                      SELECT SUM(dtp.jumlah_terima)
                      FROM detail_penerimaan dtp
